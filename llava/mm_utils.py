@@ -6,7 +6,7 @@ import math
 import ast
 
 from transformers import StoppingCriteria
-from llava.constants import IMAGE_TOKEN_INDEX
+from llava.constants import IMAGE_TOKEN_INDEX, POINTCLOUD_TOKEN_INDEX, DEFAULT_POINTCLOUD_TOKEN
 
 
 def select_best_resolution(original_size, possible_resolutions):
@@ -245,3 +245,87 @@ class KeywordsStoppingCriteria(StoppingCriteria):
         for i in range(output_ids.shape[0]):
             outputs.append(self.call_for_batch(output_ids[i].unsqueeze(0), scores))
         return all(outputs)
+
+
+def tokenizer_pointcloud_token(prompt, tokenizer, pointcloud_token_index=POINTCLOUD_TOKEN_INDEX, return_tensors=None):
+    """
+    Tokenize a prompt containing pointcloud tokens.
+    Similar to tokenizer_image_token but for pointcloud tokens.
+    """
+    prompt_chunks = [tokenizer(chunk).input_ids for chunk in prompt.split(DEFAULT_POINTCLOUD_TOKEN)]
+
+    def insert_separator(X, sep):
+        return [ele for sublist in zip(X, [sep]*len(X)) for ele in sublist][:-1]
+
+    input_ids = []
+    offset = 0
+    if len(prompt_chunks) > 0 and len(prompt_chunks[0]) > 0 and prompt_chunks[0][0] == tokenizer.bos_token_id:
+        offset = 1
+        input_ids.append(prompt_chunks[0][0])
+
+    for x in insert_separator(prompt_chunks, [pointcloud_token_index] * (offset + 1)):
+        input_ids.extend(x[offset:])
+
+    if return_tensors is not None:
+        if return_tensors == 'pt':
+            return torch.tensor(input_ids, dtype=torch.long)
+        raise ValueError(f'Unsupported tensor type: {return_tensors}')
+    return input_ids
+
+
+def tokenizer_multimodal_token(prompt, tokenizer, image_token_index=IMAGE_TOKEN_INDEX, pointcloud_token_index=POINTCLOUD_TOKEN_INDEX, return_tensors=None):
+    """
+    Tokenize a prompt containing both image and pointcloud tokens.
+    Handles the sequential processing: pointcloud tokens first, then image tokens, then text.
+    """
+    # First, split by pointcloud tokens
+    pc_chunks = prompt.split(DEFAULT_POINTCLOUD_TOKEN)
+    
+    # Process each chunk for image tokens
+    processed_chunks = []
+    for chunk in pc_chunks:
+        if '<image>' in chunk:
+            # This chunk contains image tokens, tokenize with image token handling
+            img_chunks = [tokenizer(img_chunk).input_ids for img_chunk in chunk.split('<image>')]
+            
+            def insert_separator(X, sep):
+                return [ele for sublist in zip(X, [sep]*len(X)) for ele in sublist][:-1]
+            
+            chunk_input_ids = []
+            offset = 0
+            if len(img_chunks) > 0 and len(img_chunks[0]) > 0 and img_chunks[0][0] == tokenizer.bos_token_id:
+                offset = 1
+                chunk_input_ids.append(img_chunks[0][0])
+            
+            for x in insert_separator(img_chunks, [image_token_index] * (offset + 1)):
+                chunk_input_ids.extend(x[offset:])
+                
+            processed_chunks.append(chunk_input_ids)
+        else:
+            # No image tokens, just tokenize normally
+            tokenized = tokenizer(chunk).input_ids
+            processed_chunks.append(tokenized)
+    
+    # Now insert pointcloud tokens between the processed chunks
+    def insert_separator(X, sep):
+        return [ele for sublist in zip(X, [sep]*len(X)) for ele in sublist][:-1]
+    
+    input_ids = []
+    offset = 0
+    
+    # Handle BOS token from first chunk
+    if len(processed_chunks) > 0 and len(processed_chunks[0]) > 0 and processed_chunks[0][0] == tokenizer.bos_token_id:
+        offset = 1
+        input_ids.append(processed_chunks[0][0])
+    
+    for x in insert_separator(processed_chunks, [pointcloud_token_index] * (offset + 1)):
+        if isinstance(x, list):
+            input_ids.extend(x[offset:] if offset > 0 else x)
+        else:
+            input_ids.extend(x[offset:])
+
+    if return_tensors is not None:
+        if return_tensors == 'pt':
+            return torch.tensor(input_ids, dtype=torch.long)
+        raise ValueError(f'Unsupported tensor type: {return_tensors}')
+    return input_ids

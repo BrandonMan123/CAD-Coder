@@ -27,7 +27,7 @@ import torch
 import transformers
 import tokenizers
 
-from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
+from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN, POINTCLOUD_TOKEN_INDEX, DEFAULT_POINTCLOUD_TOKEN, DEFAULT_PC_START_TOKEN, DEFAULT_PC_END_TOKEN
 from torch.utils.data import Dataset
 from llava.train.llava_trainer import LLaVATrainer
 
@@ -326,11 +326,14 @@ def preprocess_multimodal(
     data_args: DataArguments
 ) -> Dict:
     is_multimodal = data_args.is_multimodal
-    if not is_multimodal:
+    is_pointcloud_multimodal = getattr(data_args, 'is_pointcloud_multimodal', False)
+    
+    if not is_multimodal and not is_pointcloud_multimodal:
         return sources
 
     for source in sources:
         for sentence in source:
+            # Handle image tokens
             if DEFAULT_IMAGE_TOKEN in sentence['value']:
                 sentence['value'] = sentence['value'].replace(DEFAULT_IMAGE_TOKEN, '').strip()
                 sentence['value'] = DEFAULT_IMAGE_TOKEN + '\n' + sentence['value']
@@ -341,6 +344,18 @@ def preprocess_multimodal(
             if data_args.mm_use_im_start_end:
                 replace_token = DEFAULT_IM_START_TOKEN + replace_token + DEFAULT_IM_END_TOKEN
             sentence["value"] = sentence["value"].replace(DEFAULT_IMAGE_TOKEN, replace_token)
+            
+            # Handle pointcloud tokens
+            if DEFAULT_POINTCLOUD_TOKEN in sentence['value']:
+                sentence['value'] = sentence['value'].replace(DEFAULT_POINTCLOUD_TOKEN, '').strip()
+                sentence['value'] = DEFAULT_POINTCLOUD_TOKEN + '\n' + sentence['value']
+                sentence['value'] = sentence['value'].strip()
+                if "mmtag" in conversation_lib.default_conversation.version:
+                    sentence['value'] = sentence['value'].replace(DEFAULT_POINTCLOUD_TOKEN, '<Pointcloud>' + DEFAULT_POINTCLOUD_TOKEN + '</Pointcloud>')
+            replace_pc_token = DEFAULT_POINTCLOUD_TOKEN
+            if getattr(data_args, 'mm_use_pc_start_end', False):
+                replace_pc_token = DEFAULT_PC_START_TOKEN + replace_pc_token + DEFAULT_PC_END_TOKEN
+            sentence["value"] = sentence["value"].replace(DEFAULT_POINTCLOUD_TOKEN, replace_pc_token)
 
     return sources
 
@@ -348,7 +363,8 @@ def preprocess_multimodal(
 def preprocess_llama_2(
     sources,
     tokenizer: transformers.PreTrainedTokenizer,
-    has_image: bool = False
+    has_image: bool = False,
+    has_pointcloud: bool = False
 ) -> Dict:
     conv = conversation_lib.default_conversation.copy()
     roles = {"human": conv.roles[0], "gpt": conv.roles[1]}
@@ -430,7 +446,8 @@ def preprocess_llama_2(
 def preprocess_v1(
     sources,
     tokenizer: transformers.PreTrainedTokenizer,
-    has_image: bool = False
+    has_image: bool = False,
+    has_pointcloud: bool = False
 ) -> Dict:
     conv = conversation_lib.default_conversation.copy()
     roles = {"human": conv.roles[0], "gpt": conv.roles[1]}
@@ -450,9 +467,16 @@ def preprocess_v1(
         conversations.append(conv.get_prompt())
 
     # Tokenize conversations
+    from llava.mm_utils import tokenizer_image_token, tokenizer_pointcloud_token, tokenizer_multimodal_token
 
-    if has_image:
-        input_ids = torch.stack([tokenizer_image_token(prompt, tokenizer, return_tensors='pt') for prompt in conversations], dim=0)
+    if has_image or has_pointcloud:
+        if has_image and has_pointcloud:
+            # Handle both image and pointcloud tokens
+            input_ids = torch.stack([tokenizer_multimodal_token(prompt, tokenizer, return_tensors='pt') for prompt in conversations], dim=0)
+        elif has_image:
+            input_ids = torch.stack([tokenizer_image_token(prompt, tokenizer, return_tensors='pt') for prompt in conversations], dim=0)
+        elif has_pointcloud:
+            input_ids = torch.stack([tokenizer_pointcloud_token(prompt, tokenizer, return_tensors='pt') for prompt in conversations], dim=0)
     else:
         input_ids = tokenizer(
             conversations,
@@ -516,7 +540,8 @@ def preprocess_v1(
 def preprocess_mpt(
     sources,
     tokenizer: transformers.PreTrainedTokenizer,
-    has_image: bool = False
+    has_image: bool = False,
+    has_pointcloud: bool = False
 ) -> Dict:
     conv = conversation_lib.default_conversation.copy()
     roles = {"human": conv.roles[0], "gpt": conv.roles[1]}
@@ -626,7 +651,8 @@ def preprocess_plain(
 def preprocess(
     sources: Sequence[str],
     tokenizer: transformers.PreTrainedTokenizer,
-    has_image: bool = False
+    has_image: bool = False,
+    has_pointcloud: bool = False
 ) -> Dict:
     """
     Given a list of sources, each is a conversation list. This transform:
@@ -638,11 +664,11 @@ def preprocess(
     if conversation_lib.default_conversation.sep_style == conversation_lib.SeparatorStyle.PLAIN:
         return preprocess_plain(sources, tokenizer)
     if conversation_lib.default_conversation.sep_style == conversation_lib.SeparatorStyle.LLAMA_2:
-        return preprocess_llama_2(sources, tokenizer, has_image=has_image)
+        return preprocess_llama_2(sources, tokenizer, has_image=has_image, has_pointcloud=has_pointcloud)
     if conversation_lib.default_conversation.version.startswith("v1"):
-        return preprocess_v1(sources, tokenizer, has_image=has_image)
+        return preprocess_v1(sources, tokenizer, has_image=has_image, has_pointcloud=has_pointcloud)
     if conversation_lib.default_conversation.version == "mpt":
-        return preprocess_mpt(sources, tokenizer, has_image=has_image)
+        return preprocess_mpt(sources, tokenizer, has_image=has_image, has_pointcloud=has_pointcloud)
     # add end signal and concatenate together
     conversations = []
     for source in sources:
@@ -693,7 +719,8 @@ class LazySupervisedDataset(Dataset):
         length_list = []
         for sample in self.list_data_dict:
             img_tokens = 128 if 'image' in sample else 0
-            length_list.append(sum(len(conv['value'].split()) for conv in sample['conversations']) + img_tokens)
+            pc_tokens = 64 if 'pointcloud' in sample else 0  # Default pointcloud token count
+            length_list.append(sum(len(conv['value'].split()) for conv in sample['conversations']) + img_tokens + pc_tokens)
         return length_list
 
     @property
@@ -710,6 +737,9 @@ class LazySupervisedDataset(Dataset):
         if isinstance(i, int):
             sources = [sources]
         assert len(sources) == 1, "Don't know why it is wrapped to a list"  # FIXME
+        
+        # Handle image loading
+        image = None
         if 'image' in sources[0]:
             image_file = self.list_data_dict[i]['image']
             image_folder = self.data_args.image_folder
@@ -732,26 +762,53 @@ class LazySupervisedDataset(Dataset):
                 image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
             else:
                 image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
+        
+        # Handle pointcloud loading
+        pointcloud = None
+        if 'pointcloud' in sources[0]:
+            pointcloud_file = self.list_data_dict[i]['pointcloud']
+            pointcloud_folder = getattr(self.data_args, 'pointcloud_folder', None)
+            if pointcloud_folder:
+                pointcloud_path = os.path.join(pointcloud_folder, pointcloud_file)
+                # Load precomputed pointcloud embeddings (64, 382)
+                pointcloud = torch.load(pointcloud_path, map_location='cpu')
+                if pointcloud.dim() == 2:  # Ensure shape is (64, 382)
+                    assert pointcloud.shape == (64, 382), f"Expected pointcloud shape (64, 382), got {pointcloud.shape}"
+                else:
+                    raise ValueError(f"Pointcloud should be 2D tensor, got {pointcloud.dim()}D")
+        
+        # Preprocess multimodal content
+        if ('image' in sources[0]) or ('pointcloud' in sources[0]):
             sources = preprocess_multimodal(
                 copy.deepcopy([e["conversations"] for e in sources]),
                 self.data_args)
         else:
             sources = copy.deepcopy([e["conversations"] for e in sources])
+            
         data_dict = preprocess(
             sources,
             self.tokenizer,
-            has_image=('image' in self.list_data_dict[i]))
+            has_image=('image' in self.list_data_dict[i]),
+            has_pointcloud=('pointcloud' in self.list_data_dict[i]))
         if isinstance(i, int):
             data_dict = dict(input_ids=data_dict["input_ids"][0],
                              labels=data_dict["labels"][0])
 
-        # image exist in the data
+        # Add image to data_dict
         if 'image' in self.list_data_dict[i]:
             data_dict['image'] = image
         elif self.data_args.is_multimodal:
             # image does not exist in the data, but the model is multimodal
             crop_size = self.data_args.image_processor.crop_size
             data_dict['image'] = torch.zeros(3, crop_size['height'], crop_size['width'])
+            
+        # Add pointcloud to data_dict
+        if 'pointcloud' in self.list_data_dict[i]:
+            data_dict['pointcloud'] = pointcloud
+        elif getattr(self.data_args, 'is_pointcloud_multimodal', False):
+            # pointcloud does not exist in the data, but the model supports pointclouds
+            data_dict['pointcloud'] = torch.zeros(64, 382)  # Zero tensor with default pointcloud shape
+            
         return data_dict
 
 
@@ -785,6 +842,13 @@ class DataCollatorForSupervisedDataset(object):
                 batch['images'] = torch.stack(images)
             else:
                 batch['images'] = images
+
+        if 'pointcloud' in instances[0]:
+            pointclouds = [instance['pointcloud'] for instance in instances]
+            if all(x is not None and x.shape == pointclouds[0].shape for x in pointclouds):
+                batch['pointclouds'] = torch.stack(pointclouds)
+            else:
+                batch['pointclouds'] = pointclouds
 
         return batch
 
