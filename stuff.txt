@@ -8,4 +8,11 @@ During training, I want the ability to "turn on" or "turn off" the pointcloud an
 
 You can assume that the pointcloud, image and text tokens will always be in the same order, so the pointcloud tokens come first, then the image and finally the text.
 
-I want to to explain what portions of the code I need to change. You should list out a step by step plan of what needs to be changed. If there are any ambiguities, please let me know.
+I want to to explain what portions of the code I need to change. You should list out a step by step plan of what needs to be changed. Here are 3 I can think of
+
+
+HIGH	Weight Loading	Design strategy for loading pointcloud components with existing weights	Medium
+MEDIUM	Eval/Inference	Update evaluation scripts to handle pointcloud inputs	Low
+LOW	Compatibility Test	Verify backward compatibility with CAD-CODER weights	Low
+
+If there are any other changes, let me know
