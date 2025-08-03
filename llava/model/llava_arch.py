@@ -21,7 +21,7 @@ import torch.nn as nn
 from .multimodal_encoder.builder import build_vision_tower
 from .multimodal_projector.builder import build_vision_projector
 
-from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
+from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, POINTCLOUD_TOKEN_INDEX, DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN, DEFAULT_POINTCLOUD_TOKEN, DEFAULT_PC_START_TOKEN, DEFAULT_PC_END_TOKEN
 
 from llava.mm_utils import get_anyres_image_grid_shape
 
@@ -142,15 +142,34 @@ class LlavaMetaForCausalLM(ABC):
         image_features = self.get_model().mm_projector(image_features)
         return image_features
 
+    def encode_pointclouds(self, pointclouds):
+        """Encode pointcloud features using pointcloud projector"""
+        if hasattr(self.get_model(), 'pc_projector') and self.get_model().pc_projector is not None:
+            pc_features = self.get_model().pc_projector(pointclouds)
+            return pc_features
+        else:
+            raise ValueError("Pointcloud projector not found. Please initialize pointcloud modules first.")
+
     def prepare_inputs_labels_for_multimodal(
         self, input_ids, position_ids, attention_mask, past_key_values, labels,
-        images, image_sizes=None
+        images, image_sizes=None, pointclouds=None, mask_pointclouds=False, mask_images=False
     ):
         vision_tower = self.get_vision_tower()
-        if vision_tower is None or images is None or input_ids.shape[1] == 1:
+        # Check if we have any multimodal input to process
+        has_images = images is not None
+        has_pointclouds = pointclouds is not None
+        
+        # Early return if no multimodal input or single token sequence
+        if (not has_images and not has_pointclouds) or input_ids.shape[1] == 1:
+            return input_ids, position_ids, attention_mask, past_key_values, None, labels
+        
+        # Early return if we have images but no vision tower
+        if has_images and vision_tower is None:
             return input_ids, position_ids, attention_mask, past_key_values, None, labels
 
-        if type(images) is list or images.ndim == 5:
+        # Process image features if we have images
+        image_features = None
+        if has_images and (type(images) is list or images.ndim == 5):
             if type(images) is list:
                 images = [x.unsqueeze(0) if x.ndim == 3 else x for x in images]
             concat_images = torch.cat([image for image in images], dim=0)
@@ -198,8 +217,27 @@ class LlavaMetaForCausalLM(ABC):
                 image_features = new_image_features
             else:
                 raise ValueError(f"Unexpected mm_patch_merge_type: {self.config.mm_patch_merge_type}")
-        else:
+        elif has_images:
             image_features = self.encode_images(images)
+
+        # Process pointcloud features
+        pointcloud_features = None
+        if has_pointclouds:
+            if isinstance(pointclouds, list):
+                # Handle list of pointcloud tensors
+                pointcloud_features = []
+                for pc in pointclouds:
+                    if pc.dim() == 2:  # Shape: (64, 382)
+                        pc_feat = self.encode_pointclouds(pc.unsqueeze(0))  # Add batch dim
+                        pointcloud_features.append(pc_feat.squeeze(0))  # Remove batch dim
+                    else:  # Already batched
+                        pc_feat = self.encode_pointclouds(pc)
+                        pointcloud_features.append(pc_feat)
+            else:
+                # Single pointcloud tensor, shape: (batch_size, 64, 382)
+                pointcloud_features = self.encode_pointclouds(pointclouds)
+                # Split into list for consistency with image processing
+                pointcloud_features = [pointcloud_features[i] for i in range(pointcloud_features.shape[0])]
 
         # TODO: image start / end is not implemented here to support pretraining.
         if getattr(self.config, 'tune_mm_mlp_adapter', False) and getattr(self.config, 'mm_use_im_start_end', False):
@@ -229,38 +267,71 @@ class LlavaMetaForCausalLM(ABC):
         new_input_embeds = []
         new_labels = []
         cur_image_idx = 0
+        cur_pointcloud_idx = 0
+        
         for batch_idx, cur_input_ids in enumerate(input_ids):
             num_images = (cur_input_ids == IMAGE_TOKEN_INDEX).sum()
-            if num_images == 0:
-                cur_image_features = image_features[cur_image_idx]
+            num_pointclouds = (cur_input_ids == POINTCLOUD_TOKEN_INDEX).sum()
+            
+            # Handle case with no multimodal tokens
+            if num_images == 0 and num_pointclouds == 0:
                 cur_input_embeds_1 = self.get_model().embed_tokens(cur_input_ids)
-                cur_input_embeds = torch.cat([cur_input_embeds_1, cur_image_features[0:0]], dim=0)
+                # Add dummy features for consistency (0-length tensors)
+                dummy_image_features = image_features[cur_image_idx][0:0] if has_images else torch.empty(0, cur_input_embeds_1.shape[-1], device=cur_input_embeds_1.device, dtype=cur_input_embeds_1.dtype)
+                dummy_pc_features = pointcloud_features[cur_pointcloud_idx][0:0] if has_pointclouds else torch.empty(0, cur_input_embeds_1.shape[-1], device=cur_input_embeds_1.device, dtype=cur_input_embeds_1.dtype)
+                
+                cur_input_embeds = torch.cat([dummy_pc_features, dummy_image_features, cur_input_embeds_1], dim=0)
                 new_input_embeds.append(cur_input_embeds)
                 new_labels.append(labels[batch_idx])
-                cur_image_idx += 1
+                
+                if has_images:
+                    cur_image_idx += 1
+                if has_pointclouds:
+                    cur_pointcloud_idx += 1
                 continue
 
-            image_token_indices = [-1] + torch.where(cur_input_ids == IMAGE_TOKEN_INDEX)[0].tolist() + [cur_input_ids.shape[0]]
-            cur_input_ids_noim = []
+            # Simple sequence construction: pointclouds → images → text
+            # Remove pointcloud and image tokens to get clean text
             cur_labels = labels[batch_idx]
-            cur_labels_noim = []
-            for i in range(len(image_token_indices) - 1):
-                cur_input_ids_noim.append(cur_input_ids[image_token_indices[i]+1:image_token_indices[i+1]])
-                cur_labels_noim.append(cur_labels[image_token_indices[i]+1:image_token_indices[i+1]])
-            split_sizes = [x.shape[0] for x in cur_labels_noim]
-            cur_input_embeds = self.get_model().embed_tokens(torch.cat(cur_input_ids_noim))
-            cur_input_embeds_no_im = torch.split(cur_input_embeds, split_sizes, dim=0)
+            text_input_ids = cur_input_ids[(cur_input_ids != POINTCLOUD_TOKEN_INDEX) & (cur_input_ids != IMAGE_TOKEN_INDEX)]
+            text_labels = cur_labels[(cur_input_ids != POINTCLOUD_TOKEN_INDEX) & (cur_input_ids != IMAGE_TOKEN_INDEX)]
+            
+            # Get text embeddings
+            text_embeds = self.get_model().embed_tokens(text_input_ids)
+            
+            # Build sequence: [pointcloud_features] + [image_features] + [text_embeds]
             cur_new_input_embeds = []
             cur_new_labels = []
-
-            for i in range(num_images + 1):
-                cur_new_input_embeds.append(cur_input_embeds_no_im[i])
-                cur_new_labels.append(cur_labels_noim[i])
-                if i < num_images:
-                    cur_image_features = image_features[cur_image_idx]
-                    cur_image_idx += 1
-                    cur_new_input_embeds.append(cur_image_features)
-                    cur_new_labels.append(torch.full((cur_image_features.shape[0],), IGNORE_INDEX, device=cur_labels.device, dtype=cur_labels.dtype))
+            
+            # 1. Add pointcloud features first
+            if has_pointclouds and num_pointclouds > 0 and pointcloud_features is not None:
+                cur_pc_features = pointcloud_features[cur_pointcloud_idx]
+                # Apply pointcloud masking if enabled
+                if mask_pointclouds:
+                    cur_pc_features = torch.zeros_like(cur_pc_features)
+                cur_new_input_embeds.append(cur_pc_features)
+                cur_new_labels.append(torch.full((cur_pc_features.shape[0],), IGNORE_INDEX, device=cur_labels.device, dtype=cur_labels.dtype))
+                cur_pointcloud_idx += 1
+            
+            # 2. Add image features second
+            if has_images and num_images > 0:
+                cur_image_features = image_features[cur_image_idx]
+                # Apply image masking if enabled
+                if mask_images:
+                    cur_image_features = torch.zeros_like(cur_image_features)
+                cur_new_input_embeds.append(cur_image_features)
+                cur_new_labels.append(torch.full((cur_image_features.shape[0],), IGNORE_INDEX, device=cur_labels.device, dtype=cur_labels.dtype))
+                cur_image_idx += 1
+            
+            # 3. Add text embeddings last
+            cur_new_input_embeds.append(text_embeds)
+            cur_new_labels.append(text_labels)
+            
+            # Handle index increments for missing features
+            if not has_pointclouds and pointcloud_features and cur_pointcloud_idx < len(pointcloud_features):
+                cur_pointcloud_idx += 1
+            if not has_images and image_features and cur_image_idx < len(image_features):
+                cur_image_idx += 1
 
             cur_new_input_embeds = [x.to(self.device) for x in cur_new_input_embeds]
 

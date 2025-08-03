@@ -1,0 +1,11 @@
+
+I want to add pointclouds as a modality to the llava architecture.
+Pointcloud data is represented as a token embedding of fixed size. Specifically, they are shape (64, 382) where 64 is the number of tokens and 382 is the token dimension. 
+I have already precomputed the pointcloud embeddings and stored them in a pytorch file.
+
+For the model architecture,  I want to prepend pointcloud embeddings to the very start of the sequence, then followed by the image embeddings and finally the text.
+During training, I want the ability to "turn on" or "turn off" the pointcloud and image modalities by masking the corresponding tokens.
+
+You can assume that the pointcloud, image and text tokens will always be in the same order, so the pointcloud tokens come first, then the image and finally the text.
+
+I want to to explain what portions of the code I need to change. You should list out a step by step plan of what needs to be changed. If there are any ambiguities, please let me know.
