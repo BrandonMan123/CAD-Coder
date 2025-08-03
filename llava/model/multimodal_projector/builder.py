@@ -49,3 +49,51 @@ def build_vision_projector(config, delay_load=False, **kwargs):
         return IdentityMap()
 
     raise ValueError(f'Unknown projector type: {projector_type}')
+
+
+def build_pointcloud_projector(config, delay_load=False, **kwargs):
+    """
+    Build pointcloud projector to map pointcloud features to language model hidden size.
+    Pointcloud input: (batch_size, num_tokens, pointcloud_hidden_size) 
+    Output: (batch_size, num_tokens, hidden_size)
+    """
+    projector_type = getattr(config, 'pc_projector_type', 'linear')
+    pointcloud_hidden_size = getattr(config, 'pointcloud_hidden_size', 382)
+    hidden_size = config.hidden_size
+
+    if projector_type == 'linear':
+        return nn.Linear(pointcloud_hidden_size, hidden_size)
+
+    mlp_gelu_match = re.match(r'^mlp(\d+)x_gelu$', projector_type)
+    if mlp_gelu_match:
+        mlp_depth = int(mlp_gelu_match.group(1))
+        modules = [nn.Linear(pointcloud_hidden_size, hidden_size)]
+        for _ in range(1, mlp_depth):
+            modules.append(nn.GELU())
+            modules.append(nn.Linear(hidden_size, hidden_size))
+        return nn.Sequential(*modules)
+
+    if projector_type == 'identity':
+        # For identity, we need to ensure dimension compatibility
+        if pointcloud_hidden_size == hidden_size:
+            return IdentityMap()
+        else:
+            # Add a linear layer to match dimensions
+            return nn.Linear(pointcloud_hidden_size, hidden_size)
+
+    # Pointcloud-specific projector types
+    if projector_type == 'mlp2x_gelu':
+        return nn.Sequential(
+            nn.Linear(pointcloud_hidden_size, hidden_size),
+            nn.GELU(),
+            nn.Linear(hidden_size, hidden_size)
+        )
+    
+    if projector_type == 'resblock':
+        # Use a residual block for better feature learning
+        return nn.Sequential(
+            nn.Linear(pointcloud_hidden_size, hidden_size),
+            SimpleResBlock(hidden_size)
+        )
+
+    raise ValueError(f'Unknown pointcloud projector type: {projector_type}')

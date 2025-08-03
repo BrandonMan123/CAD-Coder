@@ -1079,6 +1079,22 @@ def train(attn_implementation=None):
         data_args.image_processor = vision_tower.image_processor
         data_args.is_multimodal = True
 
+    # Initialize pointcloud modules if pointcloud support is enabled
+    if getattr(model_args, 'use_pointcloud', False):
+        model.get_model().initialize_pointcloud_modules(
+            model_args=model_args,
+            fsdp=training_args.fsdp
+        )
+        
+        # Move pointcloud projector to appropriate device and dtype
+        if hasattr(model.get_model(), 'pc_projector') and model.get_model().pc_projector is not None:
+            model.get_model().pc_projector.to(
+                dtype=torch.bfloat16 if training_args.bf16 else torch.float16, 
+                device=training_args.device
+            )
+        
+        data_args.is_pointcloud_multimodal = True
+
         model.config.image_aspect_ratio = data_args.image_aspect_ratio
         model.config.tokenizer_padding_side = tokenizer.padding_side
         model.config.tokenizer_model_max_length = tokenizer.model_max_length
@@ -1088,20 +1104,35 @@ def train(attn_implementation=None):
             model.requires_grad_(False)
             for p in model.get_model().mm_projector.parameters():
                 p.requires_grad = True
+            # Also enable gradients for pointcloud projector if present
+            if hasattr(model.get_model(), 'pc_projector') and model.get_model().pc_projector is not None:
+                for p in model.get_model().pc_projector.parameters():
+                    p.requires_grad = True
 
         model.config.freeze_mm_mlp_adapter = training_args.freeze_mm_mlp_adapter
         if training_args.freeze_mm_mlp_adapter:
             for p in model.get_model().mm_projector.parameters():
                 p.requires_grad = False
+            # Also freeze pointcloud projector if present
+            if hasattr(model.get_model(), 'pc_projector') and model.get_model().pc_projector is not None:
+                for p in model.get_model().pc_projector.parameters():
+                    p.requires_grad = False
 
         if training_args.bits in [4, 8]:
             model.get_model().mm_projector.to(dtype=compute_dtype, device=training_args.device)
+            # Also move pointcloud projector for quantized training
+            if hasattr(model.get_model(), 'pc_projector') and model.get_model().pc_projector is not None:
+                model.get_model().pc_projector.to(dtype=compute_dtype, device=training_args.device)
 
         model.config.mm_use_im_start_end = data_args.mm_use_im_start_end = model_args.mm_use_im_start_end
         model.config.mm_projector_lr = training_args.mm_projector_lr
         training_args.use_im_start_end = model_args.mm_use_im_start_end
         model.config.mm_use_im_patch_token = model_args.mm_use_im_patch_token
         model.initialize_vision_tokenizer(model_args, tokenizer=tokenizer)
+
+    # Initialize pointcloud tokenizer if pointcloud support is enabled
+    if getattr(model_args, 'use_pointcloud', False):
+        model.initialize_pointcloud_tokenizer(model_args, tokenizer=tokenizer)
 
     if training_args.bits in [4, 8]:
         from peft.tuners.lora import LoraLayer

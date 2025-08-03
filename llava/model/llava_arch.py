@@ -19,7 +19,7 @@ import torch
 import torch.nn as nn
 
 from .multimodal_encoder.builder import build_vision_tower
-from .multimodal_projector.builder import build_vision_projector
+from .multimodal_projector.builder import build_vision_projector, build_pointcloud_projector
 
 from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, POINTCLOUD_TOKEN_INDEX, DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN, DEFAULT_POINTCLOUD_TOKEN, DEFAULT_PC_START_TOKEN, DEFAULT_PC_END_TOKEN
 
@@ -39,6 +39,10 @@ class LlavaMetaModel:
                 self.image_newline = nn.Parameter(
                     torch.empty(config.hidden_size, dtype=self.dtype)
                 )
+
+        # Initialize pointcloud projector if pointcloud support is enabled
+        if getattr(config, 'use_pointcloud', False):
+            self.pc_projector = build_pointcloud_projector(config)
 
     def get_vision_tower(self):
         vision_tower = getattr(self, 'vision_tower', None)
@@ -95,6 +99,39 @@ class LlavaMetaModel:
                 return {k.split(keyword + '.')[1]: v for k, v in weights.items() if keyword in k}
 
             self.mm_projector.load_state_dict(get_w(mm_projector_weights, 'mm_projector'))
+
+    def initialize_pointcloud_modules(self, model_args, fsdp=None):
+        """Initialize pointcloud projector modules"""
+        use_pointcloud = getattr(model_args, 'use_pointcloud', False)
+        pc_projector_type = getattr(model_args, 'pc_projector_type', 'linear')
+        pretrain_pc_projector = getattr(model_args, 'pretrain_pc_projector', None)
+        pointcloud_hidden_size = getattr(model_args, 'pointcloud_hidden_size', 382)
+        pointcloud_num_tokens = getattr(model_args, 'pointcloud_num_tokens', 64)
+
+        if not use_pointcloud:
+            return
+
+        # Set pointcloud configuration in model config
+        self.config.use_pointcloud = True
+        self.config.pc_projector_type = pc_projector_type
+        self.config.pointcloud_hidden_size = pointcloud_hidden_size
+        self.config.pointcloud_num_tokens = pointcloud_num_tokens
+
+        # Initialize pointcloud projector if it doesn't exist
+        if getattr(self, 'pc_projector', None) is None:
+            self.pc_projector = build_pointcloud_projector(self.config)
+        else:
+            # In case it is frozen by LoRA, ensure gradients are enabled
+            for p in self.pc_projector.parameters():
+                p.requires_grad = True
+
+        # Load pretrained pointcloud projector weights if provided
+        if pretrain_pc_projector is not None:
+            pc_projector_weights = torch.load(pretrain_pc_projector, map_location='cpu')
+            def get_w(weights, keyword):
+                return {k.split(keyword + '.')[1]: v for k, v in weights.items() if keyword in k}
+
+            self.pc_projector.load_state_dict(get_w(pc_projector_weights, 'pc_projector'))
 
 
 def unpad_image(tensor, original_size):
@@ -435,5 +472,41 @@ class LlavaMetaForCausalLM(ABC):
             if model_args.tune_mm_mlp_adapter:
                 for p in self.get_input_embeddings().parameters():
                     p.requires_grad = False
+                for p in self.get_output_embeddings().parameters():
+                    p.requires_grad = False
+
+    def initialize_pointcloud_tokenizer(self, model_args, tokenizer):
+        """Initialize pointcloud tokens in the tokenizer"""
+        if not getattr(model_args, 'use_pointcloud', False):
+            return
+
+        num_new_tokens = 0
+
+        if getattr(model_args, 'mm_use_pc_patch_token', True):
+            tokenizer.add_tokens([DEFAULT_POINTCLOUD_TOKEN], special_tokens=True)
+            num_new_tokens += 1
+            self.resize_token_embeddings(len(tokenizer))
+
+        if getattr(model_args, 'mm_use_pc_start_end', False):
+            added_tokens = tokenizer.add_tokens([DEFAULT_PC_START_TOKEN, DEFAULT_PC_END_TOKEN], special_tokens=True)
+            num_new_tokens += added_tokens
+            self.resize_token_embeddings(len(tokenizer))
+
+        # Initialize embeddings for new pointcloud tokens
+        if num_new_tokens > 0:
+            input_embeddings = self.get_input_embeddings().weight.data
+            output_embeddings = self.get_output_embeddings().weight.data
+
+            input_embeddings_avg = input_embeddings[:-num_new_tokens].mean(
+                dim=0, keepdim=True)
+            output_embeddings_avg = output_embeddings[:-num_new_tokens].mean(
+                dim=0, keepdim=True)
+
+            input_embeddings[-num_new_tokens:] = input_embeddings_avg
+            output_embeddings[-num_new_tokens:] = output_embeddings_avg
+
+            if getattr(model_args, 'tune_mm_mlp_adapter', False):
+                for p in self.get_input_embeddings().parameters():
+                    p.requires_grad = True
                 for p in self.get_output_embeddings().parameters():
                     p.requires_grad = False
