@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 import json
 import logging
 import pathlib
+import random
 from typing import Dict, Optional, Sequence, List
 
 import torch
@@ -817,6 +818,50 @@ class DataCollatorForSupervisedDataset(object):
     """Collate examples for supervised fine-tuning."""
 
     tokenizer: transformers.PreTrainedTokenizer
+    training_args: Optional = None  # Will contain training configuration
+
+    def determine_modality_masking(self):
+        """
+        Determine modality masking strategy based on training phase and probabilities.
+        Returns tuple: (mask_images, mask_pointclouds)
+        """
+        if not self.training_args:
+            return False, False
+            
+        # Get training phase and probabilities from model config or training args
+        training_phase = getattr(self.training_args, 'training_phase', 'both')
+        pc_mask_prob = getattr(self.training_args, 'pc_mask_probability', 0.0)
+        img_mask_prob = getattr(self.training_args, 'image_mask_probability', 0.0)
+        
+        # Phase 1: Pointcloud only (always mask images)
+        if training_phase == 'pointcloud_only':
+            return True, False  # mask_images=True, mask_pointclouds=False
+            
+        # Phase 2: Mixed training with probabilistic masking
+        elif training_phase == 'mixed':
+            rand_val = random.random()
+            
+            # 1/3 probability: images only (mask pointclouds)
+            if rand_val < 1/3:
+                return False, True  # mask_images=False, mask_pointclouds=True
+                
+            # 1/3 probability: pointclouds only (mask images) 
+            elif rand_val < 2/3:
+                return True, False  # mask_images=True, mask_pointclouds=False
+                
+            # 1/3 probability: both modalities (no masking)
+            else:
+                return False, False  # mask_images=False, mask_pointclouds=False
+                
+        # Phase 3: Both modalities with custom probabilities
+        elif training_phase == 'both':
+            mask_images = random.random() < img_mask_prob
+            mask_pointclouds = random.random() < pc_mask_prob
+            return mask_images, mask_pointclouds
+            
+        # Default: no masking
+        else:
+            return False, False
 
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
         input_ids, labels = tuple([instance[key] for instance in instances]
@@ -830,10 +875,17 @@ class DataCollatorForSupervisedDataset(object):
                                                  padding_value=IGNORE_INDEX)
         input_ids = input_ids[:, :self.tokenizer.model_max_length]
         labels = labels[:, :self.tokenizer.model_max_length]
+        
+        # Determine modality masking strategy
+        mask_images, mask_pointclouds = self.determine_modality_masking()
+        
         batch = dict(
             input_ids=input_ids,
             labels=labels,
             attention_mask=input_ids.ne(self.tokenizer.pad_token_id),
+            # Add masking flags for the model
+            mask_images=mask_images,
+            mask_pointclouds=mask_pointclouds,
         )
 
         if 'image' in instances[0]:
@@ -853,13 +905,41 @@ class DataCollatorForSupervisedDataset(object):
         return batch
 
 
+def configure_pointcloud_training_phase(training_args, phase='pointcloud_only', pc_mask_prob=0.0, img_mask_prob=0.0):
+    """
+    Configure training arguments for pointcloud training phases.
+    
+    Args:
+        training_args: TrainingArguments object to modify
+        phase: Training phase - 'pointcloud_only', 'mixed', 'both'
+        pc_mask_prob: Probability of masking pointclouds (for 'both' phase)
+        img_mask_prob: Probability of masking images (for 'both' phase)
+    """
+    training_args.training_phase = phase
+    training_args.pc_mask_probability = pc_mask_prob
+    training_args.image_mask_probability = img_mask_prob
+    
+    # Log the configuration
+    if hasattr(training_args, 'local_rank') and training_args.local_rank in [-1, 0]:
+        print(f"🎯 Configured pointcloud training phase: {phase}")
+        if phase == 'pointcloud_only':
+            print("   - Images will be masked (pointclouds only)")
+        elif phase == 'mixed':
+            print("   - 1/3 probability: images only")
+            print("   - 1/3 probability: pointclouds only") 
+            print("   - 1/3 probability: both modalities")
+        elif phase == 'both':
+            print(f"   - Pointcloud mask probability: {pc_mask_prob}")
+            print(f"   - Image mask probability: {img_mask_prob}")
+
+
 def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
-                                data_args) -> Dict:
+                                data_args, training_args=None) -> Dict:
     """Make dataset and collator for supervised fine-tuning."""
     train_dataset = LazySupervisedDataset(tokenizer=tokenizer,
                                 data_path=data_args.data_path,
                                 data_args=data_args)
-    data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
+    data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer, training_args=training_args)
     return dict(train_dataset=train_dataset,
                 eval_dataset=None,
                 data_collator=data_collator)
@@ -1037,7 +1117,8 @@ def train(attn_implementation=None):
                         module = module.to(torch.bfloat16)
 
     data_module = make_supervised_data_module(tokenizer=tokenizer,
-                                              data_args=data_args)
+                                              data_args=data_args,
+                                              training_args=training_args)
     trainer = LLaVATrainer(model=model,
                     tokenizer=tokenizer,
                     args=training_args,
