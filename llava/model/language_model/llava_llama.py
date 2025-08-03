@@ -29,6 +29,20 @@ from ..llava_arch import LlavaMetaModel, LlavaMetaForCausalLM
 
 class LlavaConfig(LlamaConfig):
     model_type = "llava_llama"
+    
+    # Pointcloud configuration parameters
+    use_pointcloud: bool = False
+    pointcloud_hidden_size: int = 382
+    pointcloud_num_tokens: int = 64
+    pc_projector_type: str = 'linear'
+    mm_use_pc_start_end: bool = False
+    mm_use_pc_patch_token: bool = True
+    pretrain_pc_projector: str = None
+    
+    # Training-specific pointcloud parameters
+    pc_mask_probability: float = 0.0
+    image_mask_probability: float = 0.0
+    training_phase: str = 'both'  # 'pointcloud_only', 'mixed', 'both'
 
 
 class LlavaLlamaModel(LlavaMetaModel, LlamaModel):
