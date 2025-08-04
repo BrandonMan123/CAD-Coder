@@ -67,6 +67,9 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         output_hidden_states: Optional[bool] = None,
         images: Optional[torch.FloatTensor] = None,
         image_sizes: Optional[List[List[int]]] = None,
+        pointclouds: Optional[torch.FloatTensor] = None,
+        mask_pointclouds: Optional[bool] = False,
+        mask_images: Optional[bool] = False,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
 
@@ -85,7 +88,10 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 past_key_values,
                 labels,
                 images,
-                image_sizes
+                image_sizes,
+                pointclouds,
+                mask_pointclouds,
+                mask_images
             )
 
         return super().forward(
@@ -108,6 +114,8 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         images: Optional[torch.Tensor] = None,
         pointclouds: Optional[torch.Tensor] = None,
         image_sizes: Optional[torch.Tensor] = None,
+        mask_pointclouds: Optional[bool] = False,
+        mask_images: Optional[bool] = False,
         **kwargs,
     ) -> Union[GenerateOutput, torch.LongTensor]:
         position_ids = kwargs.pop("position_ids", None)
@@ -131,7 +139,9 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 None,
                 images,
                 image_sizes=image_sizes,
-                pointclouds=pointclouds
+                pointclouds=pointclouds,
+                mask_pointclouds=mask_pointclouds,
+                mask_images=mask_images
             )
         else:
             inputs_embeds = self.get_model().embed_tokens(inputs)
@@ -148,6 +158,8 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         images = kwargs.pop("images", None)
         pointclouds = kwargs.pop("pointclouds", None)
         image_sizes = kwargs.pop("image_sizes", None)
+        mask_pointclouds = kwargs.pop("mask_pointclouds", False)
+        mask_images = kwargs.pop("mask_images", False)
         inputs = super().prepare_inputs_for_generation(
             input_ids, past_key_values=past_key_values, inputs_embeds=inputs_embeds, **kwargs
         )
