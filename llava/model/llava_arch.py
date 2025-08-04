@@ -208,7 +208,9 @@ class LlavaMetaForCausalLM(ABC):
         images, image_sizes=None, pointclouds=None, mask_pointclouds=False, mask_images=False
     ):
         vision_tower = self.get_vision_tower()
-        if vision_tower is None or images is None or input_ids.shape[1] == 1:
+        no_multimodal = images is None and pointclouds is None
+        # Early exit if no multimodal data
+        if (vision_tower is None or no_multimodal or input_ids.shape[1] == 1): 
             return input_ids, position_ids, attention_mask, past_key_values, None, labels
 
         if type(images) is list or images.ndim == 5:
@@ -260,7 +262,20 @@ class LlavaMetaForCausalLM(ABC):
             else:
                 raise ValueError(f"Unexpected mm_patch_merge_type: {self.config.mm_patch_merge_type}")
         else:
-            image_features = self.encode_images(images)
+            image_features = self.encode_images(images) if images is not None else None
+
+        # Process pointclouds
+        pointcloud_features = None
+        if pointclouds is not None:
+            pointcloud_features = self.encode_pointclouds(pointclouds)
+            if pointcloud_features is not None:
+                # Apply masking if requested
+                if mask_pointclouds:
+                    pointcloud_features = torch.zeros_like(pointcloud_features)
+
+        # Apply image masking if requested
+        if image_features is not None and mask_images:
+            image_features = torch.zeros_like(image_features)
 
         # TODO: image start / end is not implemented here to support pretraining.
         if getattr(self.config, 'tune_mm_mlp_adapter', False) and getattr(self.config, 'mm_use_im_start_end', False):
@@ -290,6 +305,7 @@ class LlavaMetaForCausalLM(ABC):
         new_input_embeds = []
         new_labels = []
         cur_image_idx = 0
+        cur_pc_idx = 0
         for batch_idx, cur_input_ids in enumerate(input_ids):
             num_images = (cur_input_ids == IMAGE_TOKEN_INDEX).sum()
             if num_images == 0:
@@ -301,29 +317,76 @@ class LlavaMetaForCausalLM(ABC):
                 cur_image_idx += 1
                 continue
 
-            image_token_indices = [-1] + torch.where(cur_input_ids == IMAGE_TOKEN_INDEX)[0].tolist() + [cur_input_ids.shape[0]]
-            cur_input_ids_noim = []
+            # -------- New sequence assembly: PC -> IMG -> TEXT --------
             cur_labels = labels[batch_idx]
-            cur_labels_noim = []
-            for i in range(len(image_token_indices) - 1):
-                cur_input_ids_noim.append(cur_input_ids[image_token_indices[i]+1:image_token_indices[i+1]])
-                cur_labels_noim.append(cur_labels[image_token_indices[i]+1:image_token_indices[i+1]])
-            split_sizes = [x.shape[0] for x in cur_labels_noim]
-            cur_input_embeds = self.get_model().embed_tokens(torch.cat(cur_input_ids_noim))
-            cur_input_embeds_no_im = torch.split(cur_input_embeds, split_sizes, dim=0)
-            cur_new_input_embeds = []
-            cur_new_labels = []
 
-            for i in range(num_images + 1):
-                cur_new_input_embeds.append(cur_input_embeds_no_im[i])
-                cur_new_labels.append(cur_labels_noim[i])
-                if i < num_images:
-                    cur_image_features = image_features[cur_image_idx]
-                    cur_image_idx += 1
-                    cur_new_input_embeds.append(cur_image_features)
-                    cur_new_labels.append(torch.full((cur_image_features.shape[0],), IGNORE_INDEX, device=cur_labels.device, dtype=cur_labels.dtype))
+            pc_supported = hasattr(self.get_model(), "pc_projector") and self.get_model().pc_projector is not None
+            pc_pos  = torch.where(cur_input_ids == POINTCLOUD_TOKEN_INDEX)[0]
+            img_pos = torch.where(cur_input_ids == IMAGE_TOKEN_INDEX)[0]
 
-            cur_new_input_embeds = [x.to(self.device) for x in cur_new_input_embeds]
+            # sanity: order guarantee
+            if len(pc_pos) and len(img_pos):
+                assert pc_pos.max() < img_pos.min(), "Point-cloud tokens must come before image tokens"
+
+            # Helper to embed a slice if it is non-empty
+            def _embed_slice(ids_slice):
+                return self.get_model().embed_tokens(ids_slice) if ids_slice.numel() else None
+
+            # text before first modality token
+            first_modal_idx = pc_pos[0] if len(pc_pos) else (img_pos[0] if len(img_pos) else cur_input_ids.shape[0])
+            text_before = cur_input_ids[:first_modal_idx]
+
+            # text sandwiched between PC and IMG (may be empty)
+            text_between = cur_input_ids[pc_pos[-1]+1:img_pos[0]] if (len(pc_pos) and len(img_pos)) else cur_input_ids[:0]
+
+            # text after last IMG token
+            text_after = cur_input_ids[img_pos[-1]+1:] if len(img_pos) else cur_input_ids[first_modal_idx:]
+
+            cur_new_input_embeds, cur_new_labels = [], []
+
+            # ---- before-PC text ----
+            emb = _embed_slice(text_before)
+            if emb is not None:
+                cur_new_input_embeds.append(emb)
+                cur_new_labels.append(cur_labels[:first_modal_idx])
+
+            # ---- point-cloud features ----
+            if len(pc_pos) and pc_supported:
+                cur_pc_features = pointcloud_features[cur_pc_idx] if isinstance(pointcloud_features, list) else pointcloud_features
+                if mask_pointclouds:
+                    cur_pc_features = torch.zeros_like(cur_pc_features)
+                cur_new_input_embeds.append(cur_pc_features)
+                cur_new_labels.append(torch.full((cur_pc_features.shape[0],), IGNORE_INDEX, device=cur_labels.device, dtype=cur_labels.dtype))
+                cur_pc_idx += 1
+            # If pc not supported we *skip* the tokens entirely (backwards compatibility)
+
+            # ---- between text ----
+            emb = _embed_slice(text_between)
+            if emb is not None:
+                start = pc_pos[-1]+1 if len(pc_pos) else first_modal_idx
+                end   = img_pos[0] if len(img_pos) else start
+                cur_new_input_embeds.append(emb)
+                cur_new_labels.append(cur_labels[start:end])
+
+            # ---- image features ----
+            if len(img_pos):
+                cur_image_features = image_features[cur_image_idx]
+                if mask_images:
+                    cur_image_features = torch.zeros_like(cur_image_features)
+                cur_new_input_embeds.append(cur_image_features)
+                cur_new_labels.append(torch.full((cur_image_features.shape[0],), IGNORE_INDEX, device=cur_labels.device, dtype=cur_labels.dtype))
+                cur_image_idx += 1
+
+            # ---- trailing text ----
+            emb = _embed_slice(text_after)
+            if emb is not None:
+                tail_start = img_pos[-1]+1 if len(img_pos) else first_modal_idx
+                cur_new_input_embeds.append(emb)
+                cur_new_labels.append(cur_labels[tail_start:])
+
+            # move to device & drop Nones
+            cur_new_input_embeds = [x.to(self.device) for x in cur_new_input_embeds if x is not None]
+            cur_new_labels = [x for x in cur_new_labels if x.numel() > 0]
 
             cur_new_input_embeds = torch.cat(cur_new_input_embeds)
             cur_new_labels = torch.cat(cur_new_labels)
