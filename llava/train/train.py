@@ -65,6 +65,20 @@ class ModelArguments:
     mm_patch_merge_type: Optional[str] = field(default='flat')
     mm_vision_select_feature: Optional[str] = field(default="patch")
 
+    # Pointcloud configuration parameters
+    use_pointcloud: bool = field(default=False)
+    pointcloud_hidden_size: int = field(default=382)
+    pointcloud_num_tokens: int = field(default=64)
+    pc_projector_type: Optional[str] = field(default='linear')
+    pretrain_pc_projector: Optional[str] = field(default=None)
+    mm_use_pc_start_end: bool = field(default=False)
+    mm_use_pc_patch_token: bool = field(default=True)
+    
+    # Training-specific pointcloud parameters
+    pc_mask_probability: float = field(default=0.0)
+    image_mask_probability: float = field(default=0.0)
+    training_phase: str = field(default='both')  # 'pointcloud_only', 'mixed', 'both'
+
 
 @dataclass
 class DataArguments:
@@ -74,6 +88,8 @@ class DataArguments:
     is_multimodal: bool = False
     image_folder: Optional[str] = field(default=None)
     image_aspect_ratio: str = 'square'
+    pointcloud_folder: Optional[str] = field(default=None)
+    is_pointcloud_multimodal: bool = False
 
 
 @dataclass
