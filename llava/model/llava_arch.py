@@ -262,7 +262,13 @@ class LlavaMetaForCausalLM(ABC):
             else:
                 raise ValueError(f"Unexpected mm_patch_merge_type: {self.config.mm_patch_merge_type}")
         else:
-            image_features = self.encode_images(images) if images is not None else None
+            if images is not None:
+                image_features = self.encode_images(images)
+                # Remove batch dimension for consistency (B, N, hidden) -> (N, hidden)
+                if image_features.ndim == 3:
+                    image_features = image_features[0]
+            else:
+                image_features = None
 
         # Process pointclouds
         pointcloud_features = None
@@ -351,7 +357,14 @@ class LlavaMetaForCausalLM(ABC):
 
             # ---- point-cloud features ----
             if len(pc_pos) and pc_supported:
-                cur_pc_features = pointcloud_features[cur_pc_idx] if isinstance(pointcloud_features, list) else pointcloud_features
+                if isinstance(pointcloud_features, list):
+                    cur_pc_features = pointcloud_features[cur_pc_idx]
+                else:
+                    # Single tensor: may include a batch dimension; collapse if so
+                    if pointcloud_features.ndim == 3:
+                        cur_pc_features = pointcloud_features[0]  # [num_tokens, hidden]
+                    else:
+                        cur_pc_features = pointcloud_features
                 if mask_pointclouds:
                     cur_pc_features = torch.zeros_like(cur_pc_features)
                 cur_new_input_embeds.append(cur_pc_features)
@@ -387,7 +400,6 @@ class LlavaMetaForCausalLM(ABC):
 
                 if mask_images:
                     cur_image_features = torch.zeros_like(cur_image_features)
-
                 cur_new_input_embeds.append(cur_image_features)
                 cur_new_labels.append(torch.full((cur_image_features.shape[0],), IGNORE_INDEX, device=cur_labels.device, dtype=cur_labels.dtype))
                 cur_image_idx += 1
