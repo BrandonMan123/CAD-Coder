@@ -21,7 +21,7 @@ import torch.nn as nn
 from .multimodal_encoder.builder import build_vision_tower
 from .multimodal_projector.builder import build_vision_projector
 
-from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
+from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, POINTCLOUD_TOKEN_INDEX, DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN, DEFAULT_POINTCLOUD_TOKEN, DEFAULT_PC_START_TOKEN, DEFAULT_PC_END_TOKEN
 
 from llava.mm_utils import get_anyres_image_grid_shape
 
@@ -39,6 +39,35 @@ class LlavaMetaModel:
                 self.image_newline = nn.Parameter(
                     torch.empty(config.hidden_size, dtype=self.dtype)
                 )
+        
+        # Initialize pointcloud projector if pointcloud config exists
+        if hasattr(config, "pc_hidden_size"):
+            self.pc_projector = self.build_pointcloud_projector(config)
+        else:
+            self.pc_projector = None
+
+    def build_pointcloud_projector(self, config):
+        """Build pointcloud projector similar to vision projector"""
+        projector_type = getattr(config, 'pc_projector_type', 'linear')
+        pc_hidden_size = getattr(config, 'pc_hidden_size', 382)  # Default pointcloud token dimension
+        
+        if projector_type == 'linear':
+            return nn.Linear(pc_hidden_size, config.hidden_size)
+        elif projector_type == 'identity':
+            return nn.Identity()
+        else:
+            # Use similar logic as vision projector for MLP
+            import re
+            mlp_gelu_match = re.match(r'^mlp(\d+)x_gelu$', projector_type)
+            if mlp_gelu_match:
+                mlp_depth = int(mlp_gelu_match.group(1))
+                modules = [nn.Linear(pc_hidden_size, config.hidden_size)]
+                for _ in range(1, mlp_depth):
+                    modules.append(nn.GELU())
+                    modules.append(nn.Linear(config.hidden_size, config.hidden_size))
+                return nn.Sequential(*modules)
+            else:
+                raise ValueError(f'Unknown pointcloud projector type: {projector_type}')
 
     def get_vision_tower(self):
         vision_tower = getattr(self, 'vision_tower', None)
@@ -96,6 +125,28 @@ class LlavaMetaModel:
 
             self.mm_projector.load_state_dict(get_w(mm_projector_weights, 'mm_projector'))
 
+    def initialize_pointcloud_modules(self, model_args):
+        """Initialize pointcloud modules similar to vision modules"""
+        pc_hidden_size = getattr(model_args, 'pc_hidden_size', 382)  # Pointcloud token dimension
+        pc_projector_type = getattr(model_args, 'pc_projector_type', 'linear')
+        pretrain_pc_mlp_adapter = getattr(model_args, 'pretrain_pc_mlp_adapter', None)
+        
+        self.config.pc_hidden_size = pc_hidden_size
+        self.config.pc_projector_type = pc_projector_type
+        
+        if getattr(self, 'pc_projector', None) is None:
+            self.pc_projector = self.build_pointcloud_projector(self.config)
+        else:
+            # In case it is frozen by LoRA
+            for p in self.pc_projector.parameters():
+                p.requires_grad = True
+
+        if pretrain_pc_mlp_adapter is not None:
+            pc_projector_weights = torch.load(pretrain_pc_mlp_adapter, map_location='cpu')
+            def get_w(weights, keyword):
+                return {k.split(keyword + '.')[1]: v for k, v in weights.items() if keyword in k}
+            self.pc_projector.load_state_dict(get_w(pc_projector_weights, 'pc_projector'))
+
 
 def unpad_image(tensor, original_size):
     """
@@ -142,9 +193,19 @@ class LlavaMetaForCausalLM(ABC):
         image_features = self.get_model().mm_projector(image_features)
         return image_features
 
+    def encode_pointclouds(self, pointclouds):
+        """Encode pointcloud features using pointcloud projector"""
+        model = self.get_model()
+        if hasattr(model, 'pc_projector') and model.pc_projector is not None:
+            pc_features = model.pc_projector(pointclouds)
+            return pc_features
+        else:
+            # For backwards compatibility, return None if no pointcloud projector
+            return None
+
     def prepare_inputs_labels_for_multimodal(
         self, input_ids, position_ids, attention_mask, past_key_values, labels,
-        images, image_sizes=None
+        images, image_sizes=None, pointclouds=None, mask_pointclouds=False, mask_images=False
     ):
         vision_tower = self.get_vision_tower()
         if vision_tower is None or images is None or input_ids.shape[1] == 1:

@@ -1,0 +1,20 @@
+I want to add pointclouds as a modality to the llava architecture.
+Pointcloud data is represented as a token embedding of fixed size. Specifically, they are shape (64, 382) where 64 is the number of tokens and 382 is the token dimension. 
+I have already precomputed the pointcloud embeddings and stored them in a pytorch file.
+
+For the model architecture,  I want to prepend pointcloud embeddings to the very start of the sequence, then followed by the image embeddings and finally the text.
+During training, I want the ability to "turn on" or "turn off" the pointcloud and image modalities by masking the corresponding tokens.
+
+You can assume that the pointcloud, image and text tokens will always be in the same order, so the pointcloud tokens come first, then the image and finally the text.
+
+Training will be divided into two phases. The first phase will be training purley on pointclouds. The second phase will be training on both pointclouds and images with the following scheme:
+1. With probability 1/3, we mask images and only present pointclouds
+2. With probabilyt 1/3, we mask pointclouds and only present images
+3. With probability 1/3 we present both pointclouds and images.
+
+Throughout the process, I want to ensure that my model is backwards compatible. This means that if I run an existing model, the model should behave normally.
+I will run the model against the following script ./scripts/v1_5/eval/test_gencadcode.sh "CADCODER/CAD-Coder" "cadquery_test_data_subset100"
+and I will manually check if the model's output makes sense. 
+I want to to explain what portions of the code I need to change. You should list out a step by step plan of what needs to be changed. If there are any ambiguities, please let me know.
+
+if you change code. You must only change at most 50 lines of code, then wait for my approval before continue coding. 
