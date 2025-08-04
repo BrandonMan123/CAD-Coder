@@ -106,6 +106,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         self,
         inputs: Optional[torch.Tensor] = None,
         images: Optional[torch.Tensor] = None,
+        pointclouds: Optional[torch.Tensor] = None,
         image_sizes: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Union[GenerateOutput, torch.LongTensor]:
@@ -114,7 +115,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         if "inputs_embeds" in kwargs:
             raise NotImplementedError("`inputs_embeds` is not supported")
 
-        if images is not None:
+        if (images is not None) or (pointclouds is not None):
             (
                 inputs,
                 position_ids,
@@ -129,7 +130,8 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 None,
                 None,
                 images,
-                image_sizes=image_sizes
+                image_sizes=image_sizes,
+                pointclouds=pointclouds
             )
         else:
             inputs_embeds = self.get_model().embed_tokens(inputs)
@@ -144,12 +146,15 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
     def prepare_inputs_for_generation(self, input_ids, past_key_values=None,
                                       inputs_embeds=None, **kwargs):
         images = kwargs.pop("images", None)
+        pointclouds = kwargs.pop("pointclouds", None)
         image_sizes = kwargs.pop("image_sizes", None)
         inputs = super().prepare_inputs_for_generation(
             input_ids, past_key_values=past_key_values, inputs_embeds=inputs_embeds, **kwargs
         )
         if images is not None:
             inputs['images'] = images
+        if pointclouds is not None:
+            inputs['pointclouds'] = pointclouds
         if image_sizes is not None:
             inputs['image_sizes'] = image_sizes
         return inputs

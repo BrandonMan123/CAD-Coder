@@ -213,7 +213,7 @@ class LlavaMetaForCausalLM(ABC):
         if (vision_tower is None or no_multimodal or input_ids.shape[1] == 1): 
             return input_ids, position_ids, attention_mask, past_key_values, None, labels
 
-        if type(images) is list or images.ndim == 5:
+        if images is not None and (type(images) is list or images.ndim == 5):
             if type(images) is list:
                 images = [x.unsqueeze(0) if x.ndim == 3 else x for x in images]
             concat_images = torch.cat([image for image in images], dim=0)
@@ -309,15 +309,14 @@ class LlavaMetaForCausalLM(ABC):
         for batch_idx, cur_input_ids in enumerate(input_ids):
             num_images = (cur_input_ids == IMAGE_TOKEN_INDEX).sum()
             if num_images == 0:
-                cur_image_features = image_features[cur_image_idx]
-                cur_input_embeds_1 = self.get_model().embed_tokens(cur_input_ids)
-                cur_input_embeds = torch.cat([cur_input_embeds_1, cur_image_features[0:0]], dim=0)
+                # No <image> tokens in this sample: simply embed text and move on.
+                cur_input_embeds = self.get_model().embed_tokens(cur_input_ids)
                 new_input_embeds.append(cur_input_embeds)
                 new_labels.append(labels[batch_idx])
-                cur_image_idx += 1
                 continue
 
-            # -------- New sequence assembly: PC -> IMG -> TEXT --------
+            image_token_indices = [-1] + torch.where(cur_input_ids == IMAGE_TOKEN_INDEX)[0].tolist() + [cur_input_ids.shape[0]]
+            cur_input_ids_noim = []
             cur_labels = labels[batch_idx]
 
             pc_supported = hasattr(self.get_model(), "pc_projector") and self.get_model().pc_projector is not None
@@ -370,9 +369,25 @@ class LlavaMetaForCausalLM(ABC):
 
             # ---- image features ----
             if len(img_pos):
-                cur_image_features = image_features[cur_image_idx]
+                if image_features is not None:
+                    # image_features can be a single tensor (from batch size 1) or a list per image
+                    if isinstance(image_features, list):
+                        if cur_image_idx < len(image_features):
+                            cur_image_features = image_features[cur_image_idx]
+                        else:
+                            cur_image_features = None
+                    else:
+                        cur_image_features = image_features
+                else:
+                    cur_image_features = None
+
+                if cur_image_features is None:
+                    # Compose a dummy tensor that preserves sequence structure and hidden size
+                    cur_image_features = torch.zeros(256, self.config.hidden_size, device=self.device, dtype=self.get_model().embed_tokens.weight.dtype)
+
                 if mask_images:
                     cur_image_features = torch.zeros_like(cur_image_features)
+
                 cur_new_input_embeds.append(cur_image_features)
                 cur_new_labels.append(torch.full((cur_image_features.shape[0],), IGNORE_INDEX, device=cur_labels.device, dtype=cur_labels.dtype))
                 cur_image_idx += 1
